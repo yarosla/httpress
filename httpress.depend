@@ -1,0 +1,47 @@
+# depslib dependency file v1.0
+1322923205 source:/home/ys/dev/cb/httpress/main.c
+	<stddef.h>
+	<stdio.h>
+	<unistd.h>
+	<fcntl.h>
+	<stdlib.h>
+	<assert.h>
+	<string.h>
+	<time.h>
+	<stdarg.h>
+	<signal.h>
+	<pthread.h>
+	<sys/stat.h>
+	<errno.h>
+	<sys/socket.h>
+	<sys/types.h>
+	<netinet/in.h>
+	<netinet/tcp.h>
+	<arpa/inet.h>
+	<sys/sendfile.h>
+	<netdb.h>
+	<ev.h>
+
+1322951032 source:/home/ys/dev/cb/httpress/httpress.c
+	<stddef.h>
+	<stdio.h>
+	<unistd.h>
+	<fcntl.h>
+	<stdlib.h>
+	<assert.h>
+	<string.h>
+	<time.h>
+	<stdarg.h>
+	<signal.h>
+	<pthread.h>
+	<sys/stat.h>
+	<errno.h>
+	<sys/socket.h>
+	<sys/types.h>
+	<netinet/in.h>
+	<netinet/tcp.h>
+	<arpa/inet.h>
+	<sys/sendfile.h>
+	<netdb.h>
+	<ev.h>
+

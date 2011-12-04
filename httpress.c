@@ -264,7 +264,7 @@ static void parse_headers(connection* conn) {
   *conn->body_ptr='\0';
   conn->body_ptr+=4;
 
-  conn->keep_alive=0;
+  conn->keep_alive=!strncasecmp(conn->buf, "HTTP/1.1", 8);
   char *p;
   for (p=strchr(conn->buf, '\n'); p; p=strchr(p, '\n')) {
     p++;

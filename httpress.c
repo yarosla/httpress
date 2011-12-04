@@ -91,7 +91,38 @@ int setup_socket(int fd) {
   int nodelay=1;
   if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay))) return -1;
 
+//  struct linger linger;
+//  linger.l_onoff=1;
+//  linger.l_linger=10; // timeout for completing reads/writes
+//  setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger));
+
   return 0;
+}
+
+void _nxweb_close_good_socket(int fd) {
+//  struct linger linger;
+//  linger.l_onoff=0; // gracefully shutdown connection
+//  linger.l_linger=0;
+//  setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger));
+//  shutdown(fd, SHUT_RDWR);
+  close(fd);
+}
+
+void _nxweb_close_bad_socket(int fd) {
+  struct linger linger;
+  linger.l_onoff=1;
+  linger.l_linger=0; // timeout for completing writes
+  setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger));
+  close(fd);
+}
+
+void sleep_ms(int ms) {
+  struct timespec req;
+  time_t sec=ms/1000;
+  ms%=1000;
+  req.tv_sec=sec;
+  req.tv_nsec=ms*1000000L;
+  while(nanosleep(&req, &req)==-1) continue;
 }
 
 struct config {
@@ -137,18 +168,20 @@ typedef struct connection {
 typedef struct thread_config {
   pthread_t tid;
   connection *conns;
+  int id;
   int num_conn;
   struct ev_loop* loop;
   ev_tstamp start_time;
   ev_timer watch_heartbeat;
 
-  int shutdown;
+  int shutdown_in_progress;
 
   int num_success;
   int num_fail;
   long num_bytes_received;
   long num_overhead_received;
   int num_connect;
+  ev_tstamp avg_req_time;
 } thread_config;
 
 static inline void inc_success(connection* conn) {
@@ -183,7 +216,7 @@ static void write_cb(struct ev_loop *loop, ev_io *w, int revents) {
       else {
         strerror_r(errno, conn->buf, sizeof(conn->buf));
         nxweb_log_error("can't connect [%d] %s", errno, conn->buf);
-        close(conn->fd);
+        _nxweb_close_bad_socket(conn->fd);
         inc_fail(conn);
         open_socket(conn);
         return;
@@ -213,7 +246,7 @@ static void write_cb(struct ev_loop *loop, ev_io *w, int revents) {
         if (errno!=EAGAIN) {
           strerror_r(errno, conn->buf, sizeof(conn->buf));
           nxweb_log_error("write() returned %d: %d %s", bytes_sent, errno, conn->buf);
-          close(conn->fd);
+          _nxweb_close_bad_socket(conn->fd);
           inc_fail(conn);
           open_socket(conn);
           return;
@@ -260,7 +293,7 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
       if (!room_avail) {
         // headers too long
         nxweb_log_error("response too long");
-        close(conn->fd);
+        _nxweb_close_bad_socket(conn->fd);
         inc_fail(conn);
         open_socket(conn);
         return;
@@ -270,7 +303,7 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
         if (errno!=EAGAIN) {
           strerror_r(errno, conn->buf, sizeof(conn->buf));
           nxweb_log_error("head [%d] read() returned error: %d %s", conn->alive_count, errno, conn->buf);
-          close(conn->fd);
+          _nxweb_close_bad_socket(conn->fd);
           inc_fail(conn);
           open_socket(conn);
           return;
@@ -284,7 +317,7 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
         parse_headers(conn);
         if (conn->bytes_to_read<0) {
           nxweb_log_error("response length unknown");
-          close(conn->fd);
+          _nxweb_close_bad_socket(conn->fd);
           inc_fail(conn);
           open_socket(conn);
           return;
@@ -297,7 +330,7 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
           return;
         }
         if (!bytes_received) { // connection closed
-          close(conn->fd);
+          _nxweb_close_bad_socket(conn->fd);
           inc_fail(conn);
           open_socket(conn);
           return;
@@ -306,7 +339,7 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
         return;
       }
       if (!bytes_received) { // connection closed
-        close(conn->fd);
+        _nxweb_close_bad_socket(conn->fd);
         inc_fail(conn);
         open_socket(conn);
         return;
@@ -330,7 +363,7 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
         if (errno!=EAGAIN) {
           strerror_r(errno, conn->buf, sizeof(conn->buf));
           nxweb_log_error("body [%d] read() returned error: %d %s", conn->alive_count, errno, conn->buf);
-          close(conn->fd);
+          _nxweb_close_bad_socket(conn->fd);
           inc_fail(conn);
           open_socket(conn);
           return;
@@ -348,24 +381,23 @@ static void shutdown_thread(thread_config* tdata) {
   int i;
   connection* conn;
   ev_tstamp now=ev_now(tdata->loop);
-  ev_tstamp avg_req_time=(now-tdata->start_time) * tdata->num_conn / tdata->num_success;
-  ev_tstamp time_limit=avg_req_time*4;
-  //printf("[%.6lf]", time_limit);
+  ev_tstamp time_limit=tdata->avg_req_time*4;
+  //fprintf(stderr, "[%.6lf]", time_limit);
   for (i=0; i<tdata->num_conn; i++) {
     conn=&tdata->conns[i];
     if (!conn->done) {
       if (ev_is_active(&conn->watch_read) || ev_is_active(&conn->watch_write)) {
         if ((now - conn->last_activity) > time_limit) {
-          // kill these connections
+          // kill this connection
           if (ev_is_active(&conn->watch_write)) ev_io_stop(conn->loop, &conn->watch_write);
           if (ev_is_active(&conn->watch_read)) ev_io_stop(conn->loop, &conn->watch_read);
-          close(conn->fd);
+          _nxweb_close_bad_socket(conn->fd);
           inc_fail(conn);
           conn->done=1;
           //fprintf(stderr, "*");
         }
         else {
-          // don't kill these yet, but wake them up
+          // don't kill this yet, but wake it up
           if (ev_is_active(&conn->watch_read)) {
             ev_feed_event(tdata->loop, &conn->watch_read, EV_READ);
           }
@@ -393,6 +425,12 @@ static int more_requests_to_run() {
 static void heartbeat_cb(struct ev_loop *loop, ev_timer *w, int revents) {
   if (config.request_counter>config.num_requests) {
     thread_config *tdata=((thread_config*)(((char*)w)-offsetof(thread_config, watch_heartbeat)));
+    if (!tdata->shutdown_in_progress) {
+      ev_tstamp now=ev_now(tdata->loop);
+      tdata->avg_req_time=tdata->num_success? (now-tdata->start_time) * tdata->num_conn / tdata->num_success : 0.1;
+      if (tdata->avg_req_time>1.) tdata->avg_req_time=1.;
+      tdata->shutdown_in_progress=1;
+    }
     shutdown_thread(tdata);
   }
 }
@@ -404,12 +442,12 @@ static void rearm_socket(connection* conn) {
   inc_success(conn);
 
   if (!config.keep_alive || !conn->keep_alive) {
-    close(conn->fd);
+    _nxweb_close_good_socket(conn->fd);
     open_socket(conn);
   }
   else {
     if (!more_requests_to_run()) {
-      close(conn->fd);
+      _nxweb_close_bad_socket(conn->fd);
       conn->done=1;
       ev_feed_event(conn->tdata->loop, &conn->tdata->watch_heartbeat, EV_TIMER);
       return;
@@ -461,20 +499,19 @@ static int open_socket(connection* conn) {
 
 static void* thread_main(void* pdata) {
   thread_config* tdata=(thread_config*)pdata;
-  //nxweb_log_error("thread %p: %d conns", (void*)tdata->tid, tdata->num_conn);
 
-  tdata->loop=ev_loop_new(0);
-
-  int i;
-  connection* conn;
-  for (i=0; i<tdata->num_conn; i++) {
-    conn=&tdata->conns[i];
-    conn->tdata=tdata;
-    conn->loop=tdata->loop;
-    ev_io_init(&conn->watch_write, write_cb, -1, EV_WRITE);
-    ev_io_init(&conn->watch_read, read_cb, -1, EV_READ);
-    if (open_socket(conn)) return 0;
-  }
+//  tdata->loop=ev_loop_new(0);
+//
+//  int i;
+//  connection* conn;
+//  for (i=0; i<tdata->num_conn; i++) {
+//    conn=&tdata->conns[i];
+//    conn->tdata=tdata;
+//    conn->loop=tdata->loop;
+//    ev_io_init(&conn->watch_write, write_cb, -1, EV_WRITE);
+//    ev_io_init(&conn->watch_read, read_cb, -1, EV_READ);
+//    if (open_socket(conn)) return 0;
+//  }
 
   ev_timer_init(&tdata->watch_heartbeat, heartbeat_cb, 0.1, 0.1);
   ev_timer_start(tdata->loop, &tdata->watch_heartbeat);
@@ -482,6 +519,12 @@ static void* thread_main(void* pdata) {
   ev_run(tdata->loop, 0);
 
   ev_loop_destroy(tdata->loop);
+
+  printf("thread %d: %d connect, %d requests, %d success, %d fail, %ld bytes, %ld overhead\n",
+         tdata->id, tdata->num_connect, tdata->num_success+tdata->num_fail,
+         tdata->num_success, tdata->num_fail, tdata->num_bytes_received,
+         tdata->num_overhead_received);
+
   return 0;
 }
 
@@ -653,12 +696,30 @@ int main(int argc, char* argv[]) {
 
 	ev_tstamp ts_start=ev_time();
   int i;
+  thread_config* tdata;
   for (i=0; i<config.num_threads; i++) {
-    threads[i].start_time=ts_start;
-    threads[i].conns=cptr;
-    threads[i].num_conn=(config.num_connections-(cptr-conn_pool))/(config.num_threads-i);
-    cptr+=threads[i].num_conn;
+    tdata=&threads[i];
+    tdata->id=i+1;
+    tdata->start_time=ts_start;
+    tdata->conns=cptr;
+    tdata->num_conn=(config.num_connections-(cptr-conn_pool))/(config.num_threads-i);
+    cptr+=tdata->num_conn;
+
+    tdata->loop=ev_loop_new(0);
+
+    int j;
+    connection* conn;
+    for (j=0; j<tdata->num_conn; j++) {
+      conn=&tdata->conns[j];
+      conn->tdata=tdata;
+      conn->loop=tdata->loop;
+      ev_io_init(&conn->watch_write, write_cb, -1, EV_WRITE);
+      ev_io_init(&conn->watch_read, read_cb, -1, EV_READ);
+      open_socket(conn);
+    }
+
     pthread_create(&threads[i].tid, 0, thread_main, &threads[i]);
+    //sleep_ms(10);
   }
 
   // Unblock signals for the main thread;
@@ -677,10 +738,6 @@ int main(int argc, char* argv[]) {
 
   for (i=0; i<config.num_threads; i++) {
     pthread_join(threads[i].tid, 0);
-    printf("thread %d: %d connect, %d requests, %d success, %d fail, %ld bytes, %ld overhead\n",
-           i+1, threads[i].num_connect, threads[i].num_success+threads[i].num_fail,
-           threads[i].num_success, threads[i].num_fail, threads[i].num_bytes_received,
-           threads[i].num_overhead_received);
     total_success+=threads[i].num_success;
     total_fail+=threads[i].num_fail;
     total_bytes+=threads[i].num_bytes_received;

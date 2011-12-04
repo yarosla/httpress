@@ -447,7 +447,7 @@ static void rearm_socket(connection* conn) {
   }
   else {
     if (!more_requests_to_run()) {
-      _nxweb_close_bad_socket(conn->fd);
+      _nxweb_close_good_socket(conn->fd);
       conn->done=1;
       ev_feed_event(conn->tdata->loop, &conn->tdata->watch_heartbeat, EV_TIMER);
       return;

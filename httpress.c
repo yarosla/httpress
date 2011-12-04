@@ -528,12 +528,13 @@ ERR1:
 
 static void show_help(void) {
 	printf( "httpress <options> <url>\n"
-          "  -n num   number of requests    (default: 1)\n"
-          "  -t num   threadcount           (default: 1)\n"
-          "  -c num   concurrent clients    (default: 1)\n"
-          "  -k       keep alive            (default: no)\n"
-          "  -h       show help and exit\n"
-          "  -v       show version and exit\n\n"
+          "  -n num   number of requests     (default: 1)\n"
+          "  -t num   number of threads      (default: 1)\n"
+          "  -c num   concurrent connections (default: 1)\n"
+          "  -k       keep alive             (default: no)\n"
+          "  -h       show this help\n"
+          //"  -v       show version\n"
+          "\n"
           "example: httpress -n 10000 -c 100 -t 4 -k http://localhost:8080/index.html\n\n");
 }
 

@@ -157,6 +157,7 @@ typedef struct connection {
   int bytes_to_read;
   int keep_alive;
   int alive_count;
+  int success_count;
   int done;
 
   char buf[32768];
@@ -185,6 +186,7 @@ typedef struct thread_config {
 } thread_config;
 
 static inline void inc_success(connection* conn) {
+  conn->success_count++;
   conn->tdata->num_success++;
   conn->tdata->num_bytes_received+=conn->bytes_to_read;
   conn->tdata->num_overhead_received+=(conn->body_ptr-conn->buf);
@@ -745,6 +747,16 @@ int main(int argc, char* argv[]) {
     total_connect+=threads[i].num_connect;
   }
 
+  int real_concurrency=0;
+  int real_concurrency1=0;
+  int real_concurrency1_threshold=config.num_requests/config.num_connections/10;
+  if (real_concurrency1_threshold<2) real_concurrency1_threshold=2;
+  for (i=0; i<config.num_connections; i++) {
+    connection* conn=&conn_pool[i];
+    if (conn->success_count) real_concurrency++;
+    if (conn->success_count>=real_concurrency1_threshold) real_concurrency1++;
+  }
+
 	ev_tstamp ts_end=ev_time();
 	ev_tstamp duration=ts_end-ts_start;
 	int sec=duration;
@@ -756,8 +768,11 @@ int main(int argc, char* argv[]) {
 	int kbps=(total_bytes+total_overhead) / (ts_end-ts_start) / 1024;
   ev_tstamp avg_req_time=(ts_end-ts_start) * config.num_connections / total_success;
 
-  printf("\nTOTALS: %d connect, %d requests, %d success, %d fail, %ld bytes, %ld overhead\n", total_connect, total_success+total_fail, total_success, total_fail, total_bytes, total_overhead);
-  printf("complete in %d.%03d seconds, %d rps, %d kbps, %.1fms avg req time\n",
+  printf("\nTOTALS:  %d connect, %d requests, %d success, %d fail, %d (%d) real concurrency\n",
+         total_connect, total_success+total_fail, total_success, total_fail, real_concurrency, real_concurrency1);
+  printf("TRAFFIC: %ld avg bytes, %ld avg overhead, %ld bytes, %ld overhead\n",
+         total_bytes/total_success, total_overhead/total_success, total_bytes, total_overhead);
+  printf("TIMING:  %d.%03d seconds, %d rps, %d kbps, %.1fms avg req time\n",
          sec, millisec, /*microsec,*/ rps, kbps, (float)(avg_req_time*1000));
 
   freeaddrinfo(config.saddr);

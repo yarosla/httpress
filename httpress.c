@@ -465,8 +465,6 @@ static void rearm_socket(connection* conn) {
 
 static int open_socket(connection* conn) {
 
-  inc_connect(conn);
-
   if (ev_is_active(&conn->watch_write)) ev_io_stop(conn->loop, &conn->watch_write);
   if (ev_is_active(&conn->watch_read)) ev_io_stop(conn->loop, &conn->watch_read);
 
@@ -476,6 +474,7 @@ static int open_socket(connection* conn) {
     return 1;
   }
 
+  inc_connect(conn);
   config.num_requests_started++;
 
   conn->fd=socket(config.saddr->ai_family, config.saddr->ai_socktype, config.saddr->ai_protocol);

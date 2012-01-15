@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011 Yaroslav Stavnichiy <yarosla@gmail.com>
+ * Copyright (c) 2011-2012 Yaroslav Stavnichiy <yarosla@gmail.com>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -144,6 +144,15 @@ struct config {
 
 static struct config config={1, 1, 1, 0, 0, 0, 0, "", 0};
 
+enum nxweb_chunked_decoder_state_code {CDS_CR1=-2, CDS_LF1=-1, CDS_SIZE=0, CDS_LF2, CDS_DATA};
+
+typedef struct nxweb_chunked_decoder_state {
+  enum nxweb_chunked_decoder_state_code state;
+  unsigned short final_chunk:1;
+  unsigned short monitor_only:1;
+  int64_t chunk_bytes_left;
+} nxweb_chunked_decoder_state;
+
 typedef struct connection {
   struct ev_loop* loop;
   struct thread_config* tdata;
@@ -152,13 +161,18 @@ typedef struct connection {
   ev_io watch_write;
   ev_tstamp last_activity;
 
+  nxweb_chunked_decoder_state cdstate;
+
   int write_pos;
   int read_pos;
   int bytes_to_read;
-  int keep_alive;
+  int bytes_received;
   int alive_count;
   int success_count;
-  int done;
+
+  int keep_alive:1;
+  int chunked:1;
+  int done:1;
 
   char buf[32768];
   char* body_ptr;
@@ -188,7 +202,7 @@ typedef struct thread_config {
 static inline void inc_success(connection* conn) {
   conn->success_count++;
   conn->tdata->num_success++;
-  conn->tdata->num_bytes_received+=conn->bytes_to_read;
+  conn->tdata->num_bytes_received+=conn->bytes_received;
   conn->tdata->num_overhead_received+=(conn->body_ptr-conn->buf);
 }
 
@@ -207,27 +221,8 @@ static void write_cb(struct ev_loop *loop, ev_io *w, int revents) {
   connection *conn=((connection*)(((char*)w)-offsetof(connection, watch_write)));
 
   if (conn->state==C_CONNECTING) {
-    if (connect(conn->fd, config.saddr->ai_addr, config.saddr->ai_addrlen)) {
-      if (errno==EINPROGRESS || errno==EALREADY) {
-        // still connecting
-        return;
-      }
-      else if (errno==EISCONN) {
-        // already connected
-      }
-      else {
-        strerror_r(errno, conn->buf, sizeof(conn->buf));
-        nxweb_log_error("can't connect [%d] %s", errno, conn->buf);
-        _nxweb_close_bad_socket(conn->fd);
-        inc_fail(conn);
-        open_socket(conn);
-        return;
-      }
-    }
     conn->last_activity=ev_now(loop);
     conn->state=C_WRITING;
-    //ev_feed_event(conn->loop, &conn->watch_write, EV_WRITE);
-    //return;
   }
 
   if (conn->state==C_WRITING) {
@@ -262,11 +257,90 @@ static void write_cb(struct ev_loop *loop, ev_io *w, int revents) {
   }
 }
 
+static int decode_chunked_stream(nxweb_chunked_decoder_state* decoder_state, char* buf, int* buf_len) {
+  char* p=buf;
+  char* d=buf;
+  char* end=buf+*buf_len;
+  char c;
+  while (p<end) {
+    c=*p;
+    switch (decoder_state->state) {
+      case CDS_DATA:
+        if (end-p>=decoder_state->chunk_bytes_left) {
+          p+=decoder_state->chunk_bytes_left;
+          decoder_state->chunk_bytes_left=0;
+          decoder_state->state=CDS_CR1;
+          d=p;
+          break;
+        }
+        else {
+          decoder_state->chunk_bytes_left-=(end-p);
+          if (!decoder_state->monitor_only) *buf_len=(end-buf);
+          return 0;
+        }
+      case CDS_CR1:
+        if (c!='\r') return -1;
+        p++;
+        decoder_state->state=CDS_LF1;
+        break;
+      case CDS_LF1:
+        if (c!='\n') return -1;
+        if (decoder_state->final_chunk) {
+          if (!decoder_state->monitor_only) *buf_len=(d-buf);
+          return 1;
+        }
+        p++;
+        decoder_state->state=CDS_SIZE;
+        break;
+      case CDS_SIZE: // read digits until CR2
+        if (c=='\r') {
+          if (!decoder_state->chunk_bytes_left) {
+            // terminator found
+            decoder_state->final_chunk=1;
+          }
+          p++;
+          decoder_state->state=CDS_LF2;
+        }
+        else {
+          if (c>='0' && c<='9') c-='0';
+          else if (c>='A' && c<='F') c=c-'A'+10;
+          else if (c>='a' && c<='f') c=c-'a'+10;
+          else return -1;
+          decoder_state->chunk_bytes_left=(decoder_state->chunk_bytes_left<<4)+c;
+          p++;
+        }
+        break;
+      case CDS_LF2:
+        if (c!='\n') return -1;
+        p++;
+        if (!decoder_state->monitor_only) {
+          memmove(d, p, end-p);
+          end-=(p-d);
+          p=d;
+        }
+        decoder_state->state=CDS_DATA;
+        break;
+    }
+  }
+  if (!decoder_state->monitor_only) *buf_len=(d-buf);
+  return 0;
+}
+
+static char* find_end_of_http_headers(char* buf, int len, char** start_of_body) {
+  if (len<4) return 0;
+  char* p;
+  for (p=memchr(buf+3, '\n', len-3); p; p=memchr(p+1, '\n', len-(p-buf)-1)) {
+    if (*(p-1)=='\n') { *start_of_body=p+1; return p-1; }
+    if (*(p-3)=='\r' && *(p-2)=='\n' && *(p-1)=='\r') { *start_of_body=p+1; return p-3; }
+  }
+  return 0;
+}
+
 static void parse_headers(connection* conn) {
-  *conn->body_ptr='\0';
-  conn->body_ptr+=4;
+  *(conn->body_ptr-1)='\0';
 
   conn->keep_alive=!strncasecmp(conn->buf, "HTTP/1.1", 8);
+  conn->bytes_to_read=-1;
   char *p;
   for (p=strchr(conn->buf, '\n'); p; p=strchr(p, '\n')) {
     p++;
@@ -275,6 +349,11 @@ static void parse_headers(connection* conn) {
       while (*p==' ' || *p=='\t') p++;
       conn->bytes_to_read=atoi(p);
     }
+    else if (!strncasecmp(p, "Transfer-Encoding:", 18)) {
+      p+=18;
+      while (*p==' ' || *p=='\t') p++;
+      conn->chunked=!strncasecmp(p, "chunked", 7);
+    }
     else if (!strncasecmp(p, "Connection:", 11)) {
       p+=11;
       while (*p==' ' || *p=='\t') p++;
@@ -282,7 +361,13 @@ static void parse_headers(connection* conn) {
     }
   }
 
-  conn->read_pos=conn->read_pos-(conn->body_ptr-conn->buf); // what already read
+  if (conn->chunked) {
+    conn->bytes_to_read=-1;
+    memset(&conn->cdstate, 0, sizeof(conn->cdstate));
+    conn->cdstate.monitor_only=1;
+  }
+
+  conn->bytes_received=conn->read_pos-(conn->body_ptr-conn->buf); // what already read
 }
 
 static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
@@ -294,7 +379,7 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
       room_avail=sizeof(conn->buf)-conn->read_pos-1;
       if (!room_avail) {
         // headers too long
-        nxweb_log_error("response too long");
+        nxweb_log_error("response headers too long");
         _nxweb_close_bad_socket(conn->fd);
         inc_fail(conn);
         open_socket(conn);
@@ -304,40 +389,12 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
       if (bytes_received<0) {
         if (errno!=EAGAIN) {
           strerror_r(errno, conn->buf, sizeof(conn->buf));
-          nxweb_log_error("head [%d] read() returned error: %d %s", conn->alive_count, errno, conn->buf);
+          nxweb_log_error("headers [%d] read() returned error: %d %s", conn->alive_count, errno, conn->buf);
           _nxweb_close_bad_socket(conn->fd);
           inc_fail(conn);
           open_socket(conn);
           return;
         }
-        return;
-      }
-      if (bytes_received) conn->last_activity=ev_now(loop);
-      conn->read_pos+=bytes_received;
-      conn->buf[conn->read_pos]='\0';
-      if ((conn->body_ptr=strstr(conn->buf, "\r\n\r\n"))) {
-        parse_headers(conn);
-        if (conn->bytes_to_read<0) {
-          nxweb_log_error("response length unknown");
-          _nxweb_close_bad_socket(conn->fd);
-          inc_fail(conn);
-          open_socket(conn);
-          return;
-        }
-        conn->state=C_READING_BODY;
-        if (conn->read_pos>=conn->bytes_to_read) {
-          // already read all
-          if (!bytes_received) conn->keep_alive=0;
-          rearm_socket(conn);
-          return;
-        }
-        if (!bytes_received) { // connection closed
-          _nxweb_close_bad_socket(conn->fd);
-          inc_fail(conn);
-          open_socket(conn);
-          return;
-        }
-        ev_feed_event(conn->loop, &conn->watch_read, EV_READ);
         return;
       }
       if (!bytes_received) { // connection closed
@@ -346,20 +403,62 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
         open_socket(conn);
         return;
       }
+      conn->last_activity=ev_now(loop);
+      conn->read_pos+=bytes_received;
+      //conn->buf[conn->read_pos]='\0';
+      if (find_end_of_http_headers(conn->buf, conn->read_pos, &conn->body_ptr)) {
+        parse_headers(conn);
+        if (conn->bytes_to_read<0 && !conn->chunked) {
+          nxweb_log_error("response length unknown");
+          _nxweb_close_bad_socket(conn->fd);
+          inc_fail(conn);
+          open_socket(conn);
+          return;
+        }
+        if (!conn->bytes_to_read) { // empty body
+          rearm_socket(conn);
+          return;
+        }
+
+        conn->state=C_READING_BODY;
+        if (!conn->chunked) {
+          if (conn->bytes_received>=conn->bytes_to_read) {
+            // already read all
+            rearm_socket(conn);
+            return;
+          }
+        }
+        else {
+          int r=decode_chunked_stream(&conn->cdstate, conn->body_ptr, &conn->bytes_received);
+          if (r<0) {
+            nxweb_log_error("chunked encoding error");
+            _nxweb_close_bad_socket(conn->fd);
+            inc_fail(conn);
+            open_socket(conn);
+            return;
+          }
+          else if (r>0) {
+            // read all
+            rearm_socket(conn);
+            return;
+          }
+        }
+        ev_feed_event(conn->loop, &conn->watch_read, EV_READ);
+        return;
+      }
     } while (bytes_received==room_avail);
     return;
   }
 
   if (conn->state==C_READING_BODY) {
-    int room_avail, bytes_received;
+    int room_avail, bytes_received, bytes_received2, r;
+    conn->last_activity=ev_now(loop);
     do {
-      room_avail=conn->bytes_to_read-conn->read_pos;
-      if (room_avail==0) {
-        // all read
-        rearm_socket(conn);
-        return;
+      room_avail=sizeof(conn->buf);
+      if (conn->bytes_to_read>0) {
+        int bytes_left=conn->bytes_to_read - conn->bytes_received;
+        if (bytes_left<room_avail) room_avail=bytes_left;
       }
-      if (room_avail>sizeof(conn->buf)) room_avail=sizeof(conn->buf);
       bytes_received=read(conn->fd, conn->buf, room_avail);
       if (bytes_received<0) {
         if (errno!=EAGAIN) {
@@ -368,12 +467,44 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
           _nxweb_close_bad_socket(conn->fd);
           inc_fail(conn);
           open_socket(conn);
-          return;
         }
         return;
       }
-      if (bytes_received) conn->last_activity=ev_now(loop);
-      conn->read_pos+=bytes_received;
+      if (!bytes_received) {
+        nxweb_log_error("body [%d] read connection closed", conn->alive_count);
+        _nxweb_close_bad_socket(conn->fd);
+        inc_fail(conn);
+        open_socket(conn);
+        return;
+      }
+
+      if (!conn->chunked) {
+        conn->bytes_received+=bytes_received;
+        if (conn->bytes_received>=conn->bytes_to_read) {
+          // read all
+          rearm_socket(conn);
+          return;
+        }
+      }
+      else {
+        bytes_received2=bytes_received;
+        r=decode_chunked_stream(&conn->cdstate, conn->buf, &bytes_received2);
+        if (r<0) {
+          nxweb_log_error("chunked encoding error after %d bytes received", conn->bytes_received);
+          _nxweb_close_bad_socket(conn->fd);
+          inc_fail(conn);
+          open_socket(conn);
+          return;
+        }
+        else if (r>0) {
+          conn->bytes_received+=bytes_received2;
+          // read all
+          rearm_socket(conn);
+          return;
+        }
+      }
+      conn->bytes_received+=bytes_received2;
+
     } while (bytes_received==room_avail);
     return;
   }
@@ -486,6 +617,12 @@ static int open_socket(connection* conn) {
   if (setup_socket(conn->fd)) {
     nxweb_log_error("can't setup socket");
     return -1;
+  }
+  if (connect(conn->fd, config.saddr->ai_addr, config.saddr->ai_addrlen)) {
+    if (errno!=EINPROGRESS && errno!=EALREADY && errno!=EISCONN) {
+      nxweb_log_error("can't connect %d", errno);
+      return -1;
+    }
   }
   conn->state=C_CONNECTING;
   conn->write_pos=0;

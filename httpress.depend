@@ -22,7 +22,7 @@
 	<netdb.h>
 	<ev.h>
 
-1323013747 source:/home/ys/dev/cb/httpress/httpress.c
+1326748809 source:/home/ys/dev/cb/httpress/httpress.c
 	<stddef.h>
 	<stdio.h>
 	<unistd.h>
@@ -43,5 +43,6 @@
 	<arpa/inet.h>
 	<sys/sendfile.h>
 	<netdb.h>
+	<gnutls/gnutls.h>
 	<ev.h>
 

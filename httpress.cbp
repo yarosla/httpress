@@ -36,6 +36,7 @@
 		<Linker>
 			<Add library="pthread" />
 			<Add library="ev" />
+			<Add library="gnutls" />
 		</Linker>
 		<Unit filename="httpress.c">
 			<Option compilerVar="CC" />

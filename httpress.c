@@ -45,9 +45,124 @@
 #include <sys/sendfile.h>
 #include <netdb.h>
 
+//#define WITH_SSL
+
+#ifdef WITH_SSL
+#include <gnutls/gnutls.h>
+#endif
+
 #include <ev.h>
 
-#define VERSION "1.0"
+#define VERSION "1.1"
+
+#if (__SIZEOF_POINTER__==8)
+typedef uint64_t int_to_ptr;
+#else
+typedef uint32_t int_to_ptr;
+#endif
+
+struct config {
+  int num_connections;
+  int num_requests;
+  int num_threads;
+	struct addrinfo *saddr;
+  const char* uri_path;
+  const char* uri_host;
+  const char* ssl_cipher_priority;
+  char request_data[4096];
+  int request_length;
+  int progress_step;
+
+#ifdef WITH_SSL
+  gnutls_certificate_credentials_t ssl_cred;
+  gnutls_priority_t priority_cache;
+#endif
+
+  int num_requests_started;
+  int num_requests_complete;
+
+  int keep_alive:1;
+  int secure:1;
+
+  volatile int request_counter;
+};
+
+static struct config config={.num_connections=1, .num_requests=1, .num_threads=1};
+
+enum nxweb_chunked_decoder_state_code {CDS_CR1=-2, CDS_LF1=-1, CDS_SIZE=0, CDS_LF2, CDS_DATA};
+
+typedef struct nxweb_chunked_decoder_state {
+  enum nxweb_chunked_decoder_state_code state;
+  unsigned short final_chunk:1;
+  unsigned short monitor_only:1;
+  int64_t chunk_bytes_left;
+} nxweb_chunked_decoder_state;
+
+typedef struct connection {
+  struct ev_loop* loop;
+  struct thread_config* tdata;
+  int fd;
+  ev_io watch_read;
+  ev_io watch_write;
+  ev_tstamp last_activity;
+
+  nxweb_chunked_decoder_state cdstate;
+
+#ifdef WITH_SSL
+  gnutls_session_t session;
+#endif
+
+  int write_pos;
+  int read_pos;
+  int bytes_to_read;
+  int bytes_received;
+  int alive_count;
+  int success_count;
+
+  int keep_alive:1;
+  int chunked:1;
+  int done:1;
+  int secure:1;
+
+  char buf[32768];
+  char* body_ptr;
+
+  enum {C_CONNECTING, C_HANDSHAKING, C_WRITING, C_READING_HEADERS, C_READING_BODY} state;
+} connection;
+
+typedef struct thread_config {
+  pthread_t tid;
+  connection *conns;
+  int id;
+  int num_conn;
+  struct ev_loop* loop;
+  ev_tstamp start_time;
+  ev_timer watch_heartbeat;
+
+  int shutdown_in_progress;
+
+  int num_success;
+  int num_fail;
+  long num_bytes_received;
+  long num_overhead_received;
+  int num_connect;
+  ev_tstamp avg_req_time;
+
+#ifdef WITH_SSL
+  _Bool ssl_identified;
+  _Bool ssl_dhe;
+  _Bool ssl_ecdh;
+  gnutls_kx_algorithm_t ssl_kx;
+  gnutls_credentials_type_t ssl_cred;
+  int ssl_dh_prime_bits;
+  gnutls_ecc_curve_t ssl_ecc_curve;
+  gnutls_protocol_t ssl_protocol;
+  gnutls_certificate_type_t ssl_cert_type;
+  gnutls_compression_method_t ssl_compression;
+  gnutls_cipher_algorithm_t ssl_cipher;
+  gnutls_mac_algorithm_t ssl_mac;
+#endif
+} thread_config;
 
 void nxweb_die(const char* fmt, ...) {
   va_list ap;
@@ -59,7 +174,7 @@ void nxweb_die(const char* fmt, ...) {
   exit(EXIT_FAILURE);
 }
 
-static const char* get_current_time(char* buf, int max_buf_size) {
+static inline const char* get_current_time(char* buf, int max_buf_size) {
   time_t t;
   struct tm tm;
   time(&t);
@@ -83,7 +198,7 @@ void nxweb_log_error(const char* fmt, ...) {
   funlockfile(stderr);
 }
 
-int setup_socket(int fd) {
+static inline int setup_socket(int fd) {
   int flags=fcntl(fd, F_GETFL);
   if (flags<0) return flags;
   if (fcntl(fd, F_SETFL, flags|=O_NONBLOCK)<0) return -1;
@@ -99,7 +214,7 @@ int setup_socket(int fd) {
   return 0;
 }
 
-void _nxweb_close_good_socket(int fd) {
+static inline void _nxweb_close_good_socket(int fd) {
 //  struct linger linger;
 //  linger.l_onoff=0; // gracefully shutdown connection
 //  linger.l_linger=0;
@@ -108,7 +223,7 @@ void _nxweb_close_good_socket(int fd) {
   close(fd);
 }
 
-void _nxweb_close_bad_socket(int fd) {
+static inline void _nxweb_close_bad_socket(int fd) {
   struct linger linger;
   linger.l_onoff=1;
   linger.l_linger=0; // timeout for completing writes
@@ -116,7 +231,7 @@ void _nxweb_close_bad_socket(int fd) {
   close(fd);
 }
 
-void sleep_ms(int ms) {
+static inline void sleep_ms(int ms) {
   struct timespec req;
   time_t sec=ms/1000;
   ms%=1000;
@@ -124,80 +239,6 @@ void sleep_ms(int ms) {
   req.tv_nsec=ms*1000000L;
   while(nanosleep(&req, &req)==-1) continue;
 }
-
-struct config {
-  int num_connections;
-  int num_requests;
-  int num_threads;
-  int keep_alive;
-	struct addrinfo *saddr;
-  const char* uri_path;
-  const char* uri_host;
-  char request_data[4096];
-  int request_length;
-  int progress_step;
-
-  volatile int request_counter;
-  int num_requests_started;
-  int num_requests_complete;
-};
-
-static struct config config={1, 1, 1, 0, 0, 0, 0, "", 0};
-
-enum nxweb_chunked_decoder_state_code {CDS_CR1=-2, CDS_LF1=-1, CDS_SIZE=0, CDS_LF2, CDS_DATA};
-
-typedef struct nxweb_chunked_decoder_state {
-  enum nxweb_chunked_decoder_state_code state;
-  unsigned short final_chunk:1;
-  unsigned short monitor_only:1;
-  int64_t chunk_bytes_left;
-} nxweb_chunked_decoder_state;
-
-typedef struct connection {
-  struct ev_loop* loop;
-  struct thread_config* tdata;
-  int fd;
-  ev_io watch_read;
-  ev_io watch_write;
-  ev_tstamp last_activity;
-
-  nxweb_chunked_decoder_state cdstate;
-
-  int write_pos;
-  int read_pos;
-  int bytes_to_read;
-  int bytes_received;
-  int alive_count;
-  int success_count;
-
-  int keep_alive:1;
-  int chunked:1;
-  int done:1;
-
-  char buf[32768];
-  char* body_ptr;
-
-  enum {C_CONNECTING, C_WRITING, C_READING_HEADERS, C_READING_BODY} state;
-} connection;
-
-typedef struct thread_config {
-  pthread_t tid;
-  connection *conns;
-  int id;
-  int num_conn;
-  struct ev_loop* loop;
-  ev_tstamp start_time;
-  ev_timer watch_heartbeat;
-
-  int shutdown_in_progress;
-
-  int num_success;
-  int num_fail;
-  long num_bytes_received;
-  long num_overhead_received;
-  int num_connect;
-  ev_tstamp avg_req_time;
-} thread_config;
 
 static inline void inc_success(connection* conn) {
   conn->success_count++;
@@ -214,16 +255,111 @@ static inline void inc_connect(connection* conn) {
   conn->tdata->num_connect++;
 }
 
+enum {ERR_AGAIN=-2, ERR_ERROR=-1, ERR_RDCLOSED=-3};
+
+static inline ssize_t conn_read(connection* conn, void* buf, size_t size) {
+#ifdef WITH_SSL
+  if (conn->secure) {
+    ssize_t ret=gnutls_record_recv(conn->session, buf, size);
+    if (ret>0) return ret;
+    if (ret==GNUTLS_E_AGAIN) return ERR_AGAIN;
+    if (ret==0) return ERR_RDCLOSED;
+    return ERR_ERROR;
+  }
+  else
+#endif
+  {
+    ssize_t ret=read(conn->fd, buf, size);
+    if (ret>0) return ret;
+    if (ret==0) return ERR_RDCLOSED;
+    if (errno==EAGAIN) return ERR_AGAIN;
+    return ERR_ERROR;
+  }
+}
+
+static inline ssize_t conn_write(connection* conn, void* buf, size_t size) {
+#ifdef WITH_SSL
+  if (conn->secure) {
+    ssize_t ret=gnutls_record_send(conn->session, buf, size);
+    if (ret>=0) return ret;
+    if (ret==GNUTLS_E_AGAIN) return ERR_AGAIN;
+    return ERR_ERROR;
+  }
+  else
+#endif
+  {
+    ssize_t ret=write(conn->fd, buf, size);
+    if (ret>=0) return ret;
+    if (errno==EAGAIN) return ERR_AGAIN;
+    return ERR_ERROR;
+  }
+}
+
+static inline void conn_close(connection* conn, int good) {
+#ifdef WITH_SSL
+  if (conn->secure) gnutls_deinit(conn->session);
+#endif
+  if (good) _nxweb_close_good_socket(conn->fd);
+  else _nxweb_close_bad_socket(conn->fd);
+}
+
 static int open_socket(connection* conn);
 static void rearm_socket(connection* conn);
+
+#ifdef WITH_SSL
+static void retrieve_ssl_session_info(connection* conn) {
+  if (conn->tdata->ssl_identified) return; // already retrieved
+  conn->tdata->ssl_identified=1;
+  gnutls_session_t session=conn->session;
+  conn->tdata->ssl_kx=gnutls_kx_get(session);
+  conn->tdata->ssl_cred=gnutls_auth_get_type(session);
+  int dhe=(conn->tdata->ssl_kx==GNUTLS_KX_DHE_RSA || conn->tdata->ssl_kx==GNUTLS_KX_DHE_DSS);
+  int ecdh=(conn->tdata->ssl_kx==GNUTLS_KX_ECDHE_RSA || conn->tdata->ssl_kx==GNUTLS_KX_ECDHE_ECDSA);
+  if (dhe) conn->tdata->ssl_dh_prime_bits=gnutls_dh_get_prime_bits(session);
+  if (ecdh) conn->tdata->ssl_ecc_curve=gnutls_ecc_curve_get(session);
+  conn->tdata->ssl_dhe=dhe;
+  conn->tdata->ssl_ecdh=ecdh;
+  conn->tdata->ssl_protocol=gnutls_protocol_get_version(session);
+  conn->tdata->ssl_cert_type=gnutls_certificate_type_get(session);
+  conn->tdata->ssl_compression=gnutls_compression_get(session);
+  conn->tdata->ssl_cipher=gnutls_cipher_get(session);
+  conn->tdata->ssl_mac=gnutls_mac_get(session);
+}
+#endif // WITH_SSL
 
 static void write_cb(struct ev_loop *loop, ev_io *w, int revents) {
   connection *conn=((connection*)(((char*)w)-offsetof(connection, watch_write)));
 
   if (conn->state==C_CONNECTING) {
     conn->last_activity=ev_now(loop);
-    conn->state=C_WRITING;
+    conn->state=conn->secure? C_HANDSHAKING : C_WRITING;
   }
+
+#ifdef WITH_SSL
+  if (conn->state==C_HANDSHAKING) {
+    conn->last_activity=ev_now(loop);
+    int ret=gnutls_handshake(conn->session);
+    if (ret==GNUTLS_E_SUCCESS) {
+      retrieve_ssl_session_info(conn);
+      conn->state=C_WRITING;
+      // fall through to C_WRITING
+    }
+    else if (ret==GNUTLS_E_AGAIN) {
+      if (!gnutls_record_get_direction(conn->session)) {
+        ev_io_stop(conn->loop, &conn->watch_write);
+        ev_io_start(conn->loop, &conn->watch_read);
+      }
+      return;
+    }
+    else {
+      nxweb_log_error("gnutls handshake error %d conn=%p", ret, conn);
+      conn_close(conn, 0);
+      inc_fail(conn);
+      open_socket(conn);
+      return;
+    }
+  }
+#endif // WITH_SSL
 
   if (conn->state==C_WRITING) {
     int bytes_avail, bytes_sent;
@@ -238,12 +374,12 @@ static void write_cb(struct ev_loop *loop, ev_io *w, int revents) {
         ev_feed_event(conn->loop, &conn->watch_read, EV_READ);
         return;
       }
-      bytes_sent=write(conn->fd, config.request_data+conn->write_pos, bytes_avail);
+      bytes_sent=conn_write(conn, config.request_data+conn->write_pos, bytes_avail);
       if (bytes_sent<0) {
-        if (errno!=EAGAIN) {
+        if (bytes_sent!=ERR_AGAIN) {
           strerror_r(errno, conn->buf, sizeof(conn->buf));
-          nxweb_log_error("write() returned %d: %d %s", bytes_sent, errno, conn->buf);
-          _nxweb_close_bad_socket(conn->fd);
+          nxweb_log_error("conn_write() returned %d: %d %s", bytes_sent, errno, conn->buf);
+          conn_close(conn, 0);
           inc_fail(conn);
           open_socket(conn);
           return;
@@ -373,6 +509,34 @@ static void parse_headers(connection* conn) {
 static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
   connection *conn=((connection*)(((char*)w)-offsetof(connection, watch_read)));
 
+#ifdef WITH_SSL
+  if (conn->state==C_HANDSHAKING) {
+    conn->last_activity=ev_now(loop);
+    int ret=gnutls_handshake(conn->session);
+    if (ret==GNUTLS_E_SUCCESS) {
+      retrieve_ssl_session_info(conn);
+      conn->state=C_WRITING;
+      ev_io_stop(conn->loop, &conn->watch_read);
+      ev_io_start(conn->loop, &conn->watch_write);
+      return;
+    }
+    else if (ret==GNUTLS_E_AGAIN) {
+      if (gnutls_record_get_direction(conn->session)) {
+        ev_io_stop(conn->loop, &conn->watch_read);
+        ev_io_start(conn->loop, &conn->watch_write);
+      }
+      return;
+    }
+    else {
+      nxweb_log_error("gnutls handshake error %d conn=%p", ret, conn);
+      conn_close(conn, 0);
+      inc_fail(conn);
+      open_socket(conn);
+      return;
+    }
+  }
+#endif // WITH_SSL
+
   if (conn->state==C_READING_HEADERS) {
     int room_avail, bytes_received;
     do {
@@ -380,25 +544,23 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
       if (!room_avail) {
         // headers too long
         nxweb_log_error("response headers too long");
-        _nxweb_close_bad_socket(conn->fd);
+        conn_close(conn, 0);
         inc_fail(conn);
         open_socket(conn);
         return;
       }
-      bytes_received=read(conn->fd, conn->buf+conn->read_pos, room_avail);
-      if (bytes_received<0) {
-        if (errno!=EAGAIN) {
-          strerror_r(errno, conn->buf, sizeof(conn->buf));
-          nxweb_log_error("headers [%d] read() returned error: %d %s", conn->alive_count, errno, conn->buf);
-          _nxweb_close_bad_socket(conn->fd);
+      bytes_received=conn_read(conn, conn->buf+conn->read_pos, room_avail);
+      if (bytes_received<=0) {
+        if (bytes_received==ERR_AGAIN) return;
+        if (bytes_received==ERR_RDCLOSED) {
+          conn_close(conn, 0);
           inc_fail(conn);
           open_socket(conn);
           return;
         }
-        return;
-      }
-      if (!bytes_received) { // connection closed
-        _nxweb_close_bad_socket(conn->fd);
+        strerror_r(errno, conn->buf, sizeof(conn->buf));
+        nxweb_log_error("headers [%d] conn_read() returned %d error: %d %s", conn->alive_count, bytes_received, errno, conn->buf);
+        conn_close(conn, 0);
         inc_fail(conn);
         open_socket(conn);
         return;
@@ -410,7 +572,7 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
         parse_headers(conn);
         if (conn->bytes_to_read<0 && !conn->chunked) {
           nxweb_log_error("response length unknown");
-          _nxweb_close_bad_socket(conn->fd);
+          conn_close(conn, 0);
           inc_fail(conn);
           open_socket(conn);
           return;
@@ -432,7 +594,7 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
           int r=decode_chunked_stream(&conn->cdstate, conn->body_ptr, &conn->bytes_received);
           if (r<0) {
             nxweb_log_error("chunked encoding error");
-            _nxweb_close_bad_socket(conn->fd);
+            conn_close(conn, 0);
             inc_fail(conn);
             open_socket(conn);
             return;
@@ -459,20 +621,19 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
         int bytes_left=conn->bytes_to_read - conn->bytes_received;
         if (bytes_left<room_avail) room_avail=bytes_left;
       }
-      bytes_received=read(conn->fd, conn->buf, room_avail);
-      if (bytes_received<0) {
-        if (errno!=EAGAIN) {
-          strerror_r(errno, conn->buf, sizeof(conn->buf));
-          nxweb_log_error("body [%d] read() returned error: %d %s", conn->alive_count, errno, conn->buf);
-          _nxweb_close_bad_socket(conn->fd);
+      bytes_received=conn_read(conn, conn->buf, room_avail);
+      if (bytes_received<=0) {
+        if (bytes_received==ERR_AGAIN) return;
+        if (bytes_received==ERR_RDCLOSED) {
+          nxweb_log_error("body [%d] read connection closed", conn->alive_count);
+          conn_close(conn, 0);
           inc_fail(conn);
           open_socket(conn);
+          return;
         }
-        return;
-      }
-      if (!bytes_received) {
-        nxweb_log_error("body [%d] read connection closed", conn->alive_count);
-        _nxweb_close_bad_socket(conn->fd);
+        strerror_r(errno, conn->buf, sizeof(conn->buf));
+        nxweb_log_error("body [%d] conn_read() returned %d error: %d %s", conn->alive_count, bytes_received, errno, conn->buf);
+        conn_close(conn, 0);
         inc_fail(conn);
         open_socket(conn);
         return;
@@ -491,7 +652,7 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
         r=decode_chunked_stream(&conn->cdstate, conn->buf, &bytes_received2);
         if (r<0) {
           nxweb_log_error("chunked encoding error after %d bytes received", conn->bytes_received);
-          _nxweb_close_bad_socket(conn->fd);
+          conn_close(conn, 0);
           inc_fail(conn);
           open_socket(conn);
           return;
@@ -524,7 +685,7 @@ static void shutdown_thread(thread_config* tdata) {
           // kill this connection
           if (ev_is_active(&conn->watch_write)) ev_io_stop(conn->loop, &conn->watch_write);
           if (ev_is_active(&conn->watch_read)) ev_io_stop(conn->loop, &conn->watch_read);
-          _nxweb_close_bad_socket(conn->fd);
+          conn_close(conn, 0);
           inc_fail(conn);
           conn->done=1;
           //fprintf(stderr, "*");
@@ -575,12 +736,12 @@ static void rearm_socket(connection* conn) {
   inc_success(conn);
 
   if (!config.keep_alive || !conn->keep_alive) {
-    _nxweb_close_good_socket(conn->fd);
+    conn_close(conn, 1);
     open_socket(conn);
   }
   else {
     if (!more_requests_to_run()) {
-      _nxweb_close_good_socket(conn->fd);
+      conn_close(conn, 1);
       conn->done=1;
       ev_feed_event(conn->tdata->loop, &conn->tdata->watch_heartbeat, EV_TIMER);
       return;
@@ -624,6 +785,17 @@ static int open_socket(connection* conn) {
       return -1;
     }
   }
+
+#ifdef WITH_SSL
+  if (config.secure) {
+    gnutls_init(&conn->session, GNUTLS_CLIENT);
+    gnutls_server_name_set(conn->session, GNUTLS_NAME_DNS, config.uri_host, strlen(config.uri_host));
+    gnutls_priority_set(conn->session, config.priority_cache);
+    gnutls_credentials_set(conn->session, GNUTLS_CRD_CERTIFICATE, config.ssl_cred);
+    gnutls_transport_set_ptr(conn->session, (gnutls_transport_ptr_t)(int_to_ptr)conn->fd);
+  }
+#endif // WITH_SSL
+
   conn->state=C_CONNECTING;
   conn->write_pos=0;
   conn->alive_count=0;
@@ -671,7 +843,7 @@ static int resolve_host(struct addrinfo** saddr, const char *host_and_port) {
   char* host=strdup(host_and_port);
   char* port=strchr(host, ':');
   if (port) *port++='\0';
-  else port="80";
+  else port=config.secure? "443":"80";
 
 	struct addrinfo hints, *res, *res_first, *res_last;
 
@@ -713,6 +885,7 @@ static void show_help(void) {
           "  -t num   number of threads      (default: 1)\n"
           "  -c num   concurrent connections (default: 1)\n"
           "  -k       keep alive             (default: no)\n"
+          "  -z pri   GNUTLS cipher priority (default: NORMAL)\n"
           "  -h       show this help\n"
           //"  -v       show version\n"
           "\n"
@@ -722,8 +895,12 @@ static void show_help(void) {
 static char host_buf[1024];
 
 static int parse_uri(const char* uri) {
-  if (strncmp(uri, "http://", 7)) return -1;
-  uri+=7;
+  if (!strncmp(uri, "http://", 7)) uri+=7;
+#ifdef WITH_SSL
+  else if (!strncmp(uri, "https://", 8)) { uri+=8; config.secure=1; }
+#endif
+  else return -1;
+
   const char* p=strchr(uri, '/');
   if (!p) {
     config.uri_host=uri;
@@ -743,14 +920,15 @@ int main(int argc, char* argv[]) {
   config.num_requests=1;
   config.num_threads=1;
   config.keep_alive=0;
-  config.uri_path="/benchmark-inprocess";
-  config.uri_host="127.0.0.1:8088";
+  config.uri_path=0;
+  config.uri_host=0;
   config.request_counter=0;
   config.num_requests_started=0;
   config.num_requests_complete=0;
+  config.ssl_cipher_priority="NORMAL"; // NORMAL:-CIPHER-ALL:+AES-256-CBC:-VERS-TLS-ALL:+VERS-TLS1.0:-KX-ALL:+DHE-RSA
 
   int c;
-	while ((c=getopt(argc, argv, ":hvkn:t:c:"))!=-1) {
+	while ((c=getopt(argc, argv, ":hvkn:t:c:z:"))!=-1) {
 		switch (c) {
 			case 'h':
 				show_help();
@@ -770,6 +948,9 @@ int main(int argc, char* argv[]) {
 				break;
 			case 'c':
 				config.num_connections=atoi(optarg);
+				break;
+			case 'z':
+				config.ssl_cipher_priority=optarg;
 				break;
 			case '?':
 				fprintf(stderr, "unkown option: -%c\n\n", optopt);
@@ -796,6 +977,15 @@ int main(int argc, char* argv[]) {
   if (config.progress_step>50000) config.progress_step=50000;
 
 	if (parse_uri(argv[optind])) nxweb_die("can't parse url");
+
+
+#ifdef WITH_SSL
+  if (config.secure) {
+    gnutls_global_init();
+    gnutls_certificate_allocate_credentials(&config.ssl_cred);
+    gnutls_priority_init(&config.priority_cache, config.ssl_cipher_priority, 0);
+  }
+#endif // WITH_SSL
 
 
   // Block signals for all threads
@@ -851,6 +1041,7 @@ int main(int argc, char* argv[]) {
       conn=&tdata->conns[j];
       conn->tdata=tdata;
       conn->loop=tdata->loop;
+      conn->secure=config.secure;
       ev_io_init(&conn->watch_write, write_cb, -1, EV_WRITE);
       ev_io_init(&conn->watch_read, read_cb, -1, EV_READ);
       open_socket(conn);
@@ -904,6 +1095,27 @@ int main(int argc, char* argv[]) {
 	int kbps=(total_bytes+total_overhead) / (ts_end-ts_start) / 1024;
   ev_tstamp avg_req_time=(ts_end-ts_start) * config.num_connections / total_success;
 
+#ifdef WITH_SSL
+  if (config.secure) {
+    for (i=0; i<config.num_threads; i++) {
+      if (threads[i].ssl_identified) {
+        printf("\nSSL INFO: %s\n", gnutls_cipher_suite_get_name(threads[i].ssl_kx, threads[i].ssl_cipher, threads[i].ssl_mac));
+        printf ("- Key Exchange: %s\n", gnutls_kx_get_name(threads[i].ssl_kx));
+        if (threads[i].ssl_ecdh) printf ("- Ephemeral ECDH using curve %s\n",
+                  gnutls_ecc_curve_get_name(threads[i].ssl_ecc_curve));
+        if (threads[i].ssl_dhe) printf ("- Ephemeral DH using prime of %d bits\n",
+                  threads[i].ssl_dh_prime_bits);
+        printf ("- Protocol: %s\n", gnutls_protocol_get_name(threads[i].ssl_protocol));
+        printf ("- Certificate Type: %s\n", gnutls_certificate_type_get_name(threads[i].ssl_cert_type));
+        printf ("- Compression: %s\n", gnutls_compression_get_name(threads[i].ssl_compression));
+        printf ("- Cipher: %s\n", gnutls_cipher_get_name(threads[i].ssl_cipher));
+        printf ("- MAC: %s\n", gnutls_mac_get_name(threads[i].ssl_mac));
+        break;
+      }
+    }
+  }
+#endif // WITH_SSL
+
   printf("\nTOTALS:  %d connect, %d requests, %d success, %d fail, %d (%d) real concurrency\n",
          total_connect, total_success+total_fail, total_success, total_fail, real_concurrency, real_concurrency1);
   printf("TRAFFIC: %ld avg bytes, %ld avg overhead, %ld bytes, %ld overhead\n",
@@ -914,6 +1126,14 @@ int main(int argc, char* argv[]) {
   freeaddrinfo(config.saddr);
   free(conn_pool);
   free(threads);
+
+#ifdef WITH_SSL
+  if (config.secure) {
+    gnutls_certificate_free_credentials(config.ssl_cred);
+    gnutls_priority_deinit(config.priority_cache);
+    gnutls_global_deinit();
+  }
+#endif // WITH_SSL
 
   return EXIT_SUCCESS;
 }

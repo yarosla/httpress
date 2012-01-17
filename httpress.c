@@ -30,6 +30,7 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <malloc.h>
 #include <string.h>
 #include <time.h>
 #include <stdarg.h>
@@ -49,6 +50,7 @@
 
 #ifdef WITH_SSL
 #include <gnutls/gnutls.h>
+#include <gnutls/x509.h>
 #endif
 
 #include <ev.h>
@@ -61,33 +63,34 @@ typedef uint64_t int_to_ptr;
 typedef uint32_t int_to_ptr;
 #endif
 
+#define MEM_GUARD 128
+
 struct config {
   int num_connections;
   int num_requests;
   int num_threads;
-	struct addrinfo *saddr;
+  int progress_step;
+  struct addrinfo *saddr;
   const char* uri_path;
   const char* uri_host;
   const char* ssl_cipher_priority;
   char request_data[4096];
   int request_length;
-  int progress_step;
 
 #ifdef WITH_SSL
   gnutls_certificate_credentials_t ssl_cred;
   gnutls_priority_t priority_cache;
 #endif
 
-  int num_requests_started;
-  int num_requests_complete;
-
   int keep_alive:1;
   int secure:1;
 
+  char _padding1[MEM_GUARD]; // guard from false sharing
   volatile int request_counter;
+  char _padding2[MEM_GUARD];
 };
 
-static struct config config={.num_connections=1, .num_requests=1, .num_threads=1};
+static struct config config;
 
 enum nxweb_chunked_decoder_state_code {CDS_CR1=-2, CDS_LF1=-1, CDS_SIZE=0, CDS_LF2, CDS_DATA};
 
@@ -97,6 +100,8 @@ typedef struct nxweb_chunked_decoder_state {
   unsigned short monitor_only:1;
   int64_t chunk_bytes_left;
 } nxweb_chunked_decoder_state;
+
+enum connection_state {C_CONNECTING, C_HANDSHAKING, C_WRITING, C_READING_HEADERS, C_READING_BODY};
 
 typedef struct connection {
   struct ev_loop* loop;
@@ -127,7 +132,7 @@ typedef struct connection {
   char buf[32768];
   char* body_ptr;
 
-  enum {C_CONNECTING, C_HANDSHAKING, C_WRITING, C_READING_HEADERS, C_READING_BODY} state;
+  enum connection_state state;
 } connection;
 
 typedef struct thread_config {
@@ -158,6 +163,7 @@ typedef struct thread_config {
   gnutls_ecc_curve_t ssl_ecc_curve;
   gnutls_protocol_t ssl_protocol;
   gnutls_certificate_type_t ssl_cert_type;
+  gnutls_x509_crt_t ssl_cert;
   gnutls_compression_method_t ssl_compression;
   gnutls_cipher_algorithm_t ssl_cipher;
   gnutls_mac_algorithm_t ssl_mac;
@@ -321,6 +327,15 @@ static void retrieve_ssl_session_info(connection* conn) {
   conn->tdata->ssl_ecdh=ecdh;
   conn->tdata->ssl_protocol=gnutls_protocol_get_version(session);
   conn->tdata->ssl_cert_type=gnutls_certificate_type_get(session);
+  if (conn->tdata->ssl_cert_type==GNUTLS_CRT_X509) {
+    const gnutls_datum_t *cert_list;
+    unsigned int cert_list_size=0;
+    cert_list=gnutls_certificate_get_peers(session, &cert_list_size);
+    if (cert_list_size>0) {
+      gnutls_x509_crt_init(&conn->tdata->ssl_cert);
+      gnutls_x509_crt_import(conn->tdata->ssl_cert, &cert_list[0], GNUTLS_X509_FMT_DER);
+    }
+  }
   conn->tdata->ssl_compression=gnutls_compression_get(session);
   conn->tdata->ssl_cipher=gnutls_cipher_get(session);
   conn->tdata->ssl_mac=gnutls_mac_get(session);
@@ -710,7 +725,7 @@ static int more_requests_to_run() {
   if (rc>config.num_requests) {
     return 0;
   }
-  if (rc%config.progress_step==0 || rc==config.num_requests) {
+  if (config.progress_step>=10 && (rc%config.progress_step==0 || rc==config.num_requests)) {
     printf("%d requests launched\n", rc);
   }
   return 1;
@@ -746,7 +761,6 @@ static void rearm_socket(connection* conn) {
       ev_feed_event(conn->tdata->loop, &conn->tdata->watch_heartbeat, EV_TIMER);
       return;
     }
-    config.num_requests_started++;
     conn->alive_count++;
     conn->state=C_WRITING;
     conn->write_pos=0;
@@ -767,7 +781,6 @@ static int open_socket(connection* conn) {
   }
 
   inc_connect(conn);
-  config.num_requests_started++;
 
   conn->fd=socket(config.saddr->ai_family, config.saddr->ai_socktype, config.saddr->ai_protocol);
   if (conn->fd==-1) {
@@ -830,10 +843,12 @@ static void* thread_main(void* pdata) {
 
   ev_loop_destroy(tdata->loop);
 
-  printf("thread %d: %d connect, %d requests, %d success, %d fail, %ld bytes, %ld overhead\n",
+  if (config.num_threads>1) {
+    printf("thread %d: %d connect, %d requests, %d success, %d fail, %ld bytes, %ld overhead\n",
          tdata->id, tdata->num_connect, tdata->num_success+tdata->num_fail,
          tdata->num_success, tdata->num_fail, tdata->num_bytes_received,
          tdata->num_overhead_received);
+  }
 
   return 0;
 }
@@ -923,60 +938,59 @@ int main(int argc, char* argv[]) {
   config.uri_path=0;
   config.uri_host=0;
   config.request_counter=0;
-  config.num_requests_started=0;
-  config.num_requests_complete=0;
   config.ssl_cipher_priority="NORMAL"; // NORMAL:-CIPHER-ALL:+AES-256-CBC:-VERS-TLS-ALL:+VERS-TLS1.0:-KX-ALL:+DHE-RSA
 
   int c;
-	while ((c=getopt(argc, argv, ":hvkn:t:c:z:"))!=-1) {
-		switch (c) {
-			case 'h':
-				show_help();
-				return 0;
-			case 'v':
-				printf("version:    " VERSION "\n");
-				printf("build-date: " __DATE__ " " __TIME__ "\n\n");
-				return 0;
-			case 'k':
-				config.keep_alive=1;
-				break;
-			case 'n':
-				config.num_requests=atoi(optarg);
-				break;
-			case 't':
-				config.num_threads=atoi(optarg);
-				break;
-			case 'c':
-				config.num_connections=atoi(optarg);
-				break;
-			case 'z':
-				config.ssl_cipher_priority=optarg;
-				break;
-			case '?':
-				fprintf(stderr, "unkown option: -%c\n\n", optopt);
-				show_help();
-				return EXIT_FAILURE;
-		}
-	}
+  while ((c=getopt(argc, argv, ":hvkn:t:c:z:"))!=-1) {
+    switch (c) {
+      case 'h':
+        show_help();
+        return 0;
+      case 'v':
+        printf("version:    " VERSION "\n");
+        printf("build-date: " __DATE__ " " __TIME__ "\n\n");
+        return 0;
+      case 'k':
+        config.keep_alive=1;
+        break;
+      case 'n':
+        config.num_requests=atoi(optarg);
+        break;
+      case 't':
+        config.num_threads=atoi(optarg);
+        break;
+      case 'c':
+        config.num_connections=atoi(optarg);
+        break;
+      case 'z':
+        config.ssl_cipher_priority=optarg;
+        break;
+      case '?':
+        fprintf(stderr, "unkown option: -%c\n\n", optopt);
+        show_help();
+        return EXIT_FAILURE;
+    }
+  }
 
-	if ((argc-optind)<1) {
-		fprintf(stderr, "%s", "missing url argument\n\n");
-		show_help();
-		return EXIT_FAILURE;
-	} else if ((argc-optind)>1) {
-		fprintf(stderr, "%s", "too many arguments\n\n");
-		show_help();
-		return EXIT_FAILURE;
-	}
+  if ((argc-optind)<1) {
+    fprintf(stderr, "%s", "missing url argument\n\n");
+    show_help();
+    return EXIT_FAILURE;
+  }
+  else if ((argc-optind)>1) {
+    fprintf(stderr, "%s", "too many arguments\n\n");
+    show_help();
+    return EXIT_FAILURE;
+  }
 
-	if (config.num_requests<1 || config.num_requests>1000000000) nxweb_die("wrong number of requests");
-	if (config.num_connections<1 || config.num_connections>1000000 || config.num_connections>config.num_requests) nxweb_die("wrong number of connections");
-	if (config.num_threads<1 || config.num_threads>100000 || config.num_threads>config.num_connections) nxweb_die("wrong number of threads");
+  if (config.num_requests<1 || config.num_requests>1000000000) nxweb_die("wrong number of requests");
+  if (config.num_connections<1 || config.num_connections>1000000 || config.num_connections>config.num_requests) nxweb_die("wrong number of connections");
+  if (config.num_threads<1 || config.num_threads>100000 || config.num_threads>config.num_connections) nxweb_die("wrong number of threads");
 
   config.progress_step=config.num_requests/4;
   if (config.progress_step>50000) config.progress_step=50000;
 
-	if (parse_uri(argv[optind])) nxweb_die("can't parse url");
+  if (parse_uri(argv[optind])) nxweb_die("can't parse url");
 
 
 #ifdef WITH_SSL
@@ -1001,10 +1015,10 @@ int main(int argc, char* argv[]) {
     exit(EXIT_FAILURE);
   }
 
-	if(resolve_host(&config.saddr, config.uri_host)) {
+  if (resolve_host(&config.saddr, config.uri_host)) {
     nxweb_log_error("Can't resolve host %s", config.uri_host);
     exit(EXIT_FAILURE);
-	}
+  }
 
   snprintf(config.request_data, sizeof(config.request_data),
            "GET %s HTTP/1.1\r\n"
@@ -1015,27 +1029,28 @@ int main(int argc, char* argv[]) {
           );
   config.request_length=strlen(config.request_data);
 
-  connection* conn_pool=calloc(config.num_connections, sizeof(connection));
-  if (!conn_pool) nxweb_die("can't allocate connection pool");
-  connection* cptr=conn_pool;
+  thread_config** threads=calloc(config.num_threads, sizeof(thread_config*));
+  if (!threads) nxweb_die("can't allocate thread pool");
 
-  thread_config* threads=calloc(config.num_threads, sizeof(thread_config));
-  if (!conn_pool) nxweb_die("can't allocate thread pool");
-
-	ev_tstamp ts_start=ev_time();
-  int i;
+  ev_tstamp ts_start=ev_time();
+  int i, j;
+  int conns_allocated=0;
   thread_config* tdata;
   for (i=0; i<config.num_threads; i++) {
-    tdata=&threads[i];
+    threads[i]=
+    tdata=memalign(MEM_GUARD, sizeof(thread_config)+MEM_GUARD);
+    if (!tdata) nxweb_die("can't allocate thread data");
+    memset(tdata, 0, sizeof(thread_config));
     tdata->id=i+1;
     tdata->start_time=ts_start;
-    tdata->conns=cptr;
-    tdata->num_conn=(config.num_connections-(cptr-conn_pool))/(config.num_threads-i);
-    cptr+=tdata->num_conn;
+    tdata->num_conn=(config.num_connections-conns_allocated)/(config.num_threads-i);
+    conns_allocated+=tdata->num_conn;
+    tdata->conns=memalign(MEM_GUARD, tdata->num_conn*sizeof(connection)+MEM_GUARD);
+    if (!tdata->conns) nxweb_die("can't allocate thread connection pool");
+    memset(tdata->conns, 0, tdata->num_conn*sizeof(connection));
 
     tdata->loop=ev_loop_new(0);
 
-    int j;
     connection* conn;
     for (j=0; j<tdata->num_conn; j++) {
       conn=&tdata->conns[j];
@@ -1047,7 +1062,7 @@ int main(int argc, char* argv[]) {
       open_socket(conn);
     }
 
-    pthread_create(&threads[i].tid, 0, thread_main, &threads[i]);
+    pthread_create(&tdata->tid, 0, thread_main, tdata);
     //sleep_ms(10);
   }
 
@@ -1066,50 +1081,63 @@ int main(int argc, char* argv[]) {
   int total_connect=0;
 
   for (i=0; i<config.num_threads; i++) {
-    pthread_join(threads[i].tid, 0);
-    total_success+=threads[i].num_success;
-    total_fail+=threads[i].num_fail;
-    total_bytes+=threads[i].num_bytes_received;
-    total_overhead+=threads[i].num_overhead_received;
-    total_connect+=threads[i].num_connect;
+    tdata=threads[i];
+    pthread_join(threads[i]->tid, 0);
+    total_success+=tdata->num_success;
+    total_fail+=tdata->num_fail;
+    total_bytes+=tdata->num_bytes_received;
+    total_overhead+=tdata->num_overhead_received;
+    total_connect+=tdata->num_connect;
   }
 
   int real_concurrency=0;
   int real_concurrency1=0;
   int real_concurrency1_threshold=config.num_requests/config.num_connections/10;
   if (real_concurrency1_threshold<2) real_concurrency1_threshold=2;
-  for (i=0; i<config.num_connections; i++) {
-    connection* conn=&conn_pool[i];
-    if (conn->success_count) real_concurrency++;
-    if (conn->success_count>=real_concurrency1_threshold) real_concurrency1++;
+  for (i=0; i<config.num_threads; i++) {
+    tdata=threads[i];
+    for (j=0; j<tdata->num_conn; j++) {
+      connection* conn=&tdata->conns[j];
+      if (conn->success_count) real_concurrency++;
+      if (conn->success_count>=real_concurrency1_threshold) real_concurrency1++;
+    }
   }
 
-	ev_tstamp ts_end=ev_time();
-	ev_tstamp duration=ts_end-ts_start;
-	int sec=duration;
-	duration=(duration-sec)*1000;
-	int millisec=duration;
-	duration=(duration-millisec)*1000;
-	//int microsec=duration;
-	int rps=total_success/(ts_end-ts_start);
-	int kbps=(total_bytes+total_overhead) / (ts_end-ts_start) / 1024;
-  ev_tstamp avg_req_time=(ts_end-ts_start) * config.num_connections / total_success;
+  ev_tstamp ts_end=ev_time();
+  if (ts_end<=ts_start) ts_end=ts_start+0.00001;
+  ev_tstamp duration=ts_end-ts_start;
+  int sec=duration;
+  duration=(duration-sec)*1000;
+  int millisec=duration;
+  duration=(duration-millisec)*1000;
+  //int microsec=duration;
+  int rps=total_success/(ts_end-ts_start);
+  int kbps=(total_bytes+total_overhead) / (ts_end-ts_start) / 1024;
+  ev_tstamp avg_req_time=total_success? (ts_end-ts_start) * config.num_connections / total_success : 0;
 
 #ifdef WITH_SSL
   if (config.secure) {
     for (i=0; i<config.num_threads; i++) {
-      if (threads[i].ssl_identified) {
-        printf("\nSSL INFO: %s\n", gnutls_cipher_suite_get_name(threads[i].ssl_kx, threads[i].ssl_cipher, threads[i].ssl_mac));
-        printf ("- Key Exchange: %s\n", gnutls_kx_get_name(threads[i].ssl_kx));
-        if (threads[i].ssl_ecdh) printf ("- Ephemeral ECDH using curve %s\n",
-                  gnutls_ecc_curve_get_name(threads[i].ssl_ecc_curve));
-        if (threads[i].ssl_dhe) printf ("- Ephemeral DH using prime of %d bits\n",
-                  threads[i].ssl_dh_prime_bits);
-        printf ("- Protocol: %s\n", gnutls_protocol_get_name(threads[i].ssl_protocol));
-        printf ("- Certificate Type: %s\n", gnutls_certificate_type_get_name(threads[i].ssl_cert_type));
-        printf ("- Compression: %s\n", gnutls_compression_get_name(threads[i].ssl_compression));
-        printf ("- Cipher: %s\n", gnutls_cipher_get_name(threads[i].ssl_cipher));
-        printf ("- MAC: %s\n", gnutls_mac_get_name(threads[i].ssl_mac));
+      tdata=threads[i];
+      if (tdata->ssl_identified) {
+        printf("\nSSL INFO: %s\n", gnutls_cipher_suite_get_name(tdata->ssl_kx, tdata->ssl_cipher, tdata->ssl_mac));
+        printf ("- Protocol: %s\n", gnutls_protocol_get_name(tdata->ssl_protocol));
+        printf ("- Key Exchange: %s\n", gnutls_kx_get_name(tdata->ssl_kx));
+        if (tdata->ssl_ecdh) printf ("- Ephemeral ECDH using curve %s\n",
+                  gnutls_ecc_curve_get_name(tdata->ssl_ecc_curve));
+        if (tdata->ssl_dhe) printf ("- Ephemeral DH using prime of %d bits\n",
+                  tdata->ssl_dh_prime_bits);
+        printf ("- Cipher: %s\n", gnutls_cipher_get_name(tdata->ssl_cipher));
+        printf ("- MAC: %s\n", gnutls_mac_get_name(tdata->ssl_mac));
+        printf ("- Compression: %s\n", gnutls_compression_get_name(tdata->ssl_compression));
+        printf ("- Certificate Type: %s\n", gnutls_certificate_type_get_name(tdata->ssl_cert_type));
+        if (tdata->ssl_cert) {
+          gnutls_datum_t cinfo;
+          if (!gnutls_x509_crt_print(tdata->ssl_cert, GNUTLS_CRT_PRINT_ONELINE, &cinfo)) {
+            printf ("- Certificate Info: %s\n", cinfo.data);
+            gnutls_free(cinfo.data);
+          }
+        }
         break;
       }
     }
@@ -1119,12 +1147,19 @@ int main(int argc, char* argv[]) {
   printf("\nTOTALS:  %d connect, %d requests, %d success, %d fail, %d (%d) real concurrency\n",
          total_connect, total_success+total_fail, total_success, total_fail, real_concurrency, real_concurrency1);
   printf("TRAFFIC: %ld avg bytes, %ld avg overhead, %ld bytes, %ld overhead\n",
-         total_bytes/total_success, total_overhead/total_success, total_bytes, total_overhead);
-  printf("TIMING:  %d.%03d seconds, %d rps, %d kbps, %.1fms avg req time\n",
+         total_success?total_bytes/total_success:0L, total_success?total_overhead/total_success:0L, total_bytes, total_overhead);
+  printf("TIMING:  %d.%03d seconds, %d rps, %d kbps, %.1f ms avg req time\n",
          sec, millisec, /*microsec,*/ rps, kbps, (float)(avg_req_time*1000));
 
   freeaddrinfo(config.saddr);
-  free(conn_pool);
+  for (i=0; i<config.num_threads; i++) {
+    tdata=threads[i];
+    free(tdata->conns);
+#ifdef WITH_SSL
+    if (tdata->ssl_cert) gnutls_x509_crt_deinit(tdata->ssl_cert);
+#endif // WITH_SSL
+    free(tdata);
+  }
   free(threads);
 
 #ifdef WITH_SSL

@@ -973,12 +973,12 @@ int main(int argc, char* argv[]) {
   }
 
   if ((argc-optind)<1) {
-    fprintf(stderr, "%s", "missing url argument\n\n");
+    fprintf(stderr, "missing url argument\n\n");
     show_help();
     return EXIT_FAILURE;
   }
   else if ((argc-optind)>1) {
-    fprintf(stderr, "%s", "too many arguments\n\n");
+    fprintf(stderr, "too many arguments\n\n");
     show_help();
     return EXIT_FAILURE;
   }
@@ -990,14 +990,18 @@ int main(int argc, char* argv[]) {
   config.progress_step=config.num_requests/4;
   if (config.progress_step>50000) config.progress_step=50000;
 
-  if (parse_uri(argv[optind])) nxweb_die("can't parse url");
+  if (parse_uri(argv[optind])) nxweb_die("can't parse url: %s", argv[optind]);
 
 
 #ifdef WITH_SSL
   if (config.secure) {
     gnutls_global_init();
     gnutls_certificate_allocate_credentials(&config.ssl_cred);
-    gnutls_priority_init(&config.priority_cache, config.ssl_cipher_priority, 0);
+    int ret=gnutls_priority_init(&config.priority_cache, config.ssl_cipher_priority, 0);
+    if (ret) {
+      fprintf(stderr, "invalid priority string: %s\n\n", config.ssl_cipher_priority);
+      return EXIT_FAILURE;
+    }
   }
 #endif // WITH_SSL
 
@@ -1011,12 +1015,12 @@ int main(int argc, char* argv[]) {
   sigaddset(&set, SIGQUIT);
   sigaddset(&set, SIGHUP);
   if (pthread_sigmask(SIG_BLOCK, &set, NULL)) {
-    nxweb_log_error("Can't set pthread_sigmask");
+    nxweb_log_error("can't set pthread_sigmask");
     exit(EXIT_FAILURE);
   }
 
   if (resolve_host(&config.saddr, config.uri_host)) {
-    nxweb_log_error("Can't resolve host %s", config.uri_host);
+    nxweb_log_error("can't resolve host %s", config.uri_host);
     exit(EXIT_FAILURE);
   }
 
@@ -1070,7 +1074,7 @@ int main(int argc, char* argv[]) {
   // other threads have inherited sigmask we set earlier
   sigdelset(&set, SIGPIPE); // except SIGPIPE
   if (pthread_sigmask(SIG_UNBLOCK, &set, NULL)) {
-    nxweb_log_error("Can't unset pthread_sigmask");
+    nxweb_log_error("can't unset pthread_sigmask");
     exit(EXIT_FAILURE);
   }
 

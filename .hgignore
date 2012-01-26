@@ -6,3 +6,4 @@ build
 dist
 Makefile\.nb
 \.dep\.inc
+callgrind\..*

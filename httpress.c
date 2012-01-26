@@ -679,7 +679,6 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
           return;
         }
       }
-      conn->bytes_received+=bytes_received2;
 
     } while (bytes_received==room_avail);
     return;

@@ -359,7 +359,8 @@ static void write_cb(struct ev_loop *loop, ev_io *w, int revents) {
       conn->state=C_WRITING;
       // fall through to C_WRITING
     }
-    else if (ret==GNUTLS_E_AGAIN) {
+    else if (ret==GNUTLS_E_AGAIN || !gnutls_error_is_fatal(ret)) {
+      if (ret!=GNUTLS_E_AGAIN) nxweb_log_error("gnutls handshake non-fatal error [%d] %s conn=%p", ret, gnutls_strerror(ret), conn);
       if (!gnutls_record_get_direction(conn->session)) {
         ev_io_stop(conn->loop, &conn->watch_write);
         ev_io_start(conn->loop, &conn->watch_read);
@@ -367,7 +368,7 @@ static void write_cb(struct ev_loop *loop, ev_io *w, int revents) {
       return;
     }
     else {
-      nxweb_log_error("gnutls handshake error %d conn=%p", ret, conn);
+      nxweb_log_error("gnutls handshake error [%d] %s conn=%p", ret, gnutls_strerror(ret), conn);
       conn_close(conn, 0);
       inc_fail(conn);
       open_socket(conn);
@@ -535,7 +536,8 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
       ev_io_start(conn->loop, &conn->watch_write);
       return;
     }
-    else if (ret==GNUTLS_E_AGAIN) {
+    else if (ret==GNUTLS_E_AGAIN || !gnutls_error_is_fatal(ret)) {
+      if (ret!=GNUTLS_E_AGAIN) nxweb_log_error("gnutls handshake non-fatal error [%d] %s conn=%p", ret, gnutls_strerror(ret), conn);
       if (gnutls_record_get_direction(conn->session)) {
         ev_io_stop(conn->loop, &conn->watch_read);
         ev_io_start(conn->loop, &conn->watch_write);
@@ -543,7 +545,7 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
       return;
     }
     else {
-      nxweb_log_error("gnutls handshake error %d conn=%p", ret, conn);
+      nxweb_log_error("gnutls handshake error [%d] %s conn=%p", ret, gnutls_strerror(ret), conn);
       conn_close(conn, 0);
       inc_fail(conn);
       open_socket(conn);
@@ -1077,11 +1079,11 @@ int main(int argc, char* argv[]) {
     exit(EXIT_FAILURE);
   }
 
-  int total_success=0;
-  int total_fail=0;
+  long total_success=0;
+  long total_fail=0;
   long total_bytes=0;
   long total_overhead=0;
-  int total_connect=0;
+  long total_connect=0;
 
   for (i=0; i<config.num_threads; i++) {
     tdata=threads[i];
@@ -1112,7 +1114,7 @@ int main(int argc, char* argv[]) {
   int sec=duration;
   duration=(duration-sec)*1000;
   int millisec=duration;
-  duration=(duration-millisec)*1000;
+  //duration=(duration-millisec)*1000;
   //int microsec=duration;
   int rps=total_success/(ts_end-ts_start);
   int kbps=(total_bytes+total_overhead) / (ts_end-ts_start) / 1024;
@@ -1147,7 +1149,7 @@ int main(int argc, char* argv[]) {
   }
 #endif // WITH_SSL
 
-  printf("\nTOTALS:  %d connect, %d requests, %d success, %d fail, %d (%d) real concurrency\n",
+  printf("\nTOTALS:  %ld connect, %ld requests, %ld success, %ld fail, %d (%d) real concurrency\n",
          total_connect, total_success+total_fail, total_success, total_fail, real_concurrency, real_concurrency1);
   printf("TRAFFIC: %ld avg bytes, %ld avg overhead, %ld bytes, %ld overhead\n",
          total_success?total_bytes/total_success:0L, total_success?total_overhead/total_success:0L, total_bytes, total_overhead);

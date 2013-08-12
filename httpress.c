@@ -84,6 +84,7 @@ struct config {
 
   int keep_alive:1;
   int secure:1;
+  int quiet:1;
 
   char _padding1[MEM_GUARD]; // guard from false sharing
   volatile int request_counter;
@@ -726,7 +727,7 @@ static int more_requests_to_run() {
   if (rc>config.num_requests) {
     return 0;
   }
-  if (config.progress_step>=10 && (rc%config.progress_step==0 || rc==config.num_requests)) {
+  if (!config.quiet && config.progress_step>=10 && (rc%config.progress_step==0 || rc==config.num_requests)) {
     printf("%d requests launched\n", rc);
   }
   return 1;
@@ -844,7 +845,7 @@ static void* thread_main(void* pdata) {
 
   ev_loop_destroy(tdata->loop);
 
-  if (config.num_threads>1) {
+  if (!config.quiet && config.num_threads>1) {
     printf("thread %d: %d connect, %d requests, %d success, %d fail, %ld bytes, %ld overhead\n",
          tdata->id, tdata->num_connect, tdata->num_success+tdata->num_fail,
          tdata->num_success, tdata->num_fail, tdata->num_bytes_received,
@@ -901,6 +902,7 @@ static void show_help(void) {
           "  -t num   number of threads      (default: 1)\n"
           "  -c num   concurrent connections (default: 1)\n"
           "  -k       keep alive             (default: no)\n"
+          "  -q       no progress indication (default: no)\n"
           "  -z pri   GNUTLS cipher priority (default: NORMAL)\n"
           "  -h       show this help\n"
           //"  -v       show version\n"
@@ -936,13 +938,14 @@ int main(int argc, char* argv[]) {
   config.num_requests=1;
   config.num_threads=1;
   config.keep_alive=0;
+  config.quiet=0;
   config.uri_path=0;
   config.uri_host=0;
   config.request_counter=0;
   config.ssl_cipher_priority="NORMAL"; // NORMAL:-CIPHER-ALL:+AES-256-CBC:-VERS-TLS-ALL:+VERS-TLS1.0:-KX-ALL:+DHE-RSA
 
   int c;
-  while ((c=getopt(argc, argv, ":hvkn:t:c:z:"))!=-1) {
+  while ((c=getopt(argc, argv, ":hvkqn:t:c:z:"))!=-1) {
     switch (c) {
       case 'h':
         show_help();
@@ -953,6 +956,9 @@ int main(int argc, char* argv[]) {
         return 0;
       case 'k':
         config.keep_alive=1;
+        break;
+      case 'q':
+        config.quiet=1;
         break;
       case 'n':
         config.num_requests=atoi(optarg);
@@ -1121,7 +1127,7 @@ int main(int argc, char* argv[]) {
   ev_tstamp avg_req_time=total_success? (ts_end-ts_start) * config.num_connections / total_success : 0;
 
 #ifdef WITH_SSL
-  if (config.secure) {
+  if (config.secure && !config.quiet) {
     for (i=0; i<config.num_threads; i++) {
       tdata=threads[i];
       if (tdata->ssl_identified) {
@@ -1149,7 +1155,8 @@ int main(int argc, char* argv[]) {
   }
 #endif // WITH_SSL
 
-  printf("\nTOTALS:  %ld connect, %ld requests, %ld success, %ld fail, %d (%d) real concurrency\n",
+  if (!config.quiet) printf("\n");
+  printf("TOTALS:  %ld connect, %ld requests, %ld success, %ld fail, %d (%d) real concurrency\n",
          total_connect, total_success+total_fail, total_success, total_fail, real_concurrency, real_concurrency1);
   printf("TRAFFIC: %ld avg bytes, %ld avg overhead, %ld bytes, %ld overhead\n",
          total_success?total_bytes/total_success:0L, total_success?total_overhead/total_success:0L, total_bytes, total_overhead);

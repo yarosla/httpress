@@ -46,3 +46,7 @@ Compared to weighttp, httpress offers the following improvements:
 httpress is written by Yaroslav Stavnichiy.
 
 Home page: https://github.com/yarosla/httpress
+
+## Report issues
+
+https://github.com/yarosla/httpress/issues

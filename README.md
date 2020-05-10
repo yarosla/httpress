@@ -30,8 +30,8 @@ Compared to weighttp, httpress offers the following improvements:
 
 ## Dependencies
 
-* Depends on [[http://software.schmorp.de/pkg/libev.html|libev]] library
-* Depends on [[http://www.gnu.org/software/gnutls/|GnuTLS]] library (if compiled with SSL support)
+* Depends on [libev](http://software.schmorp.de/pkg/libev.html) library
+* Depends on [GnuTLS](http://www.gnu.org/software/gnutls/) library (if compiled with SSL support)
 
 ## Building from source
 
